@@ -3,7 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const { Client } = require("pg");
 const Facturapi = require("facturapi").default;
-
+const { DateTime } = require("luxon");
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "2mb" }));
@@ -29,9 +29,14 @@ app.get("/api/orders/lookup", async (req, res) => {
     return res.status(400).json({ error: "date y numcheque son requeridos" });
   }
 
-  const start = new Date(`${date}T00:00:00.000Z`);
-  const end = new Date(`${date}T00:00:00.000Z`);
-  end.setUTCDate(end.getUTCDate() + 1);
+  const tz = process.env.RESTAURANT_TZ || "America/Mexico_City";
+
+  // “date” viene como YYYY-MM-DD y lo interpretamos como fecha LOCAL del restaurante
+  const startUtc = DateTime.fromISO(date, { zone: tz }).startOf("day").toUTC();
+  const endUtc = startUtc.plus({ days: 1 });
+
+  const start = startUtc.toISO();
+  const end = endUtc.toISO();
 
   const q = `
     select id, folio, numcheque, mesa, fecha, cierre, total, subtotal, totalimpuesto1
@@ -42,11 +47,7 @@ app.get("/api/orders/lookup", async (req, res) => {
     order by fecha desc
     limit 20
   `;
-  const r = await db.query(q, [
-    numcheque,
-    start.toISOString(),
-    end.toISOString(),
-  ]);
+  const r = await db.query(q, [numcheque, start, end]);
   return res.json({ count: r.rows.length, orders: r.rows });
 });
 
