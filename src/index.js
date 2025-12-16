@@ -39,15 +39,20 @@ app.get("/api/orders/lookup", async (req, res) => {
   const end = endUtc.toISO();
 
   const q = `
-    select id, folio, numcheque, mesa, fecha, cierre, total, subtotal, totalimpuesto1
-    from public.orders
-    where numcheque = $1
-      and fecha >= $2
-      and fecha < $3
-    order by fecha desc
-    limit 20
-  `;
+  select
+    o.id, o.folio, o.numcheque, o.mesa, o.fecha, o.cierre, o.total, o.subtotal, o.totalimpuesto1,
+    i.id as "invoiceId",
+    i.emailed_at as "emailedAt"
+  from public.orders o
+  left join public.invoices i on i.order_id = o.id
+  where o.numcheque = $1
+    and o.fecha >= $2
+    and o.fecha < $3
+  order by o.fecha desc
+  limit 20
+`;
   const r = await db.query(q, [numcheque, start, end]);
+
   return res.json({ count: r.rows.length, orders: r.rows });
 });
 
@@ -55,17 +60,48 @@ app.get("/api/orders/lookup", async (req, res) => {
  * Generar factura:
  * body: { orderId, customer:{ legalName, taxId, email, address:{ zip } }, cfdiUse, paymentForm }
  */
-app.post("/api/invoices", async (req, res) => {
-  const { orderId, customer, cfdiUse, paymentForm } = req.body || {};
+async function verifyRecaptcha(token) {
+  if (String(process.env.RECAPTCHA_ENABLED || "false") !== "true") return true;
 
+  if (!process.env.RECAPTCHA_SECRET)
+    throw new Error("Missing RECAPTCHA_SECRET");
+  if (!token) return false;
+
+  const params = new URLSearchParams();
+  params.append("secret", process.env.RECAPTCHA_SECRET);
+  params.append("response", token);
+
+  const resp = await fetch("https://www.google.com/recaptcha/api/siteverify", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  const data = await resp.json();
+  return !!data.success;
+}
+
+app.post("/api/invoices", async (req, res) => {
+  const { orderId, customer, cfdiUse, paymentForm, recaptchaToken } =
+    req.body || {};
+
+  // 1) reCAPTCHA
+  const okCaptcha = await verifyRecaptcha(recaptchaToken);
+  if (!okCaptcha)
+    return res
+      .status(400)
+      .json({ error: "reCAPTCHA inválido. Intenta de nuevo." });
+
+  // 2) Validaciones (email obligatorio)
   if (
     !orderId ||
     !customer?.taxId ||
     !customer?.legalName ||
-    !customer?.taxSystem
+    !customer?.taxSystem ||
+    !customer?.email
   ) {
     return res.status(400).json({
-      error: "Faltan campos requeridos (incluye régimen fiscal / taxSystem)",
+      error: "Faltan campos requeridos (incluye email y régimen fiscal)",
     });
   }
   if (String(customer.taxSystem).length !== 3) {
@@ -74,6 +110,7 @@ app.post("/api/invoices", async (req, res) => {
       .json({ error: "taxSystem debe ser de 3 caracteres (ej: 601)" });
   }
 
+  // 3) Order existe
   const ord = await db.query(
     `select * from public.orders where id=$1 limit 1`,
     [orderId]
@@ -82,7 +119,7 @@ app.post("/api/invoices", async (req, res) => {
     return res.status(404).json({ error: "Order no encontrado" });
   const order = ord.rows[0];
 
-  // ya facturada?
+  // 4) ¿Ya facturada? -> NO permitir llenar datos, solo devolver PDF/ZIP
   const ex = await db.query(
     `select * from public.invoices where order_id=$1 limit 1`,
     [orderId]
@@ -90,6 +127,7 @@ app.post("/api/invoices", async (req, res) => {
   if (ex.rows.length) {
     return res.json({
       ok: true,
+      alreadyInvoiced: true,
       invoiceId: ex.rows[0].id,
       pdfUrl: `/api/invoices/${ex.rows[0].id}/pdf`,
       zipUrl: `/api/invoices/${ex.rows[0].id}/zip`,
@@ -98,18 +136,83 @@ app.post("/api/invoices", async (req, res) => {
 
   const facturapi = fp();
 
-  const createdCustomer = await facturapi.customers.create({
-    legal_name: customer.legalName,
-    tax_id: customer.taxId,
-    tax_system: String(customer.taxSystem), // régimen fiscal (3 chars)
-    email: customer.email,
-    address: customer.address,
-  });
+  // 5) Upsert customer en DB (buscar por tax_id)
+  let customerRow = await db.query(
+    `select * from public.customers where tax_id=$1 limit 1`,
+    [String(customer.taxId)]
+  );
+  let localCustomer = customerRow.rows[0];
 
+  // Si no existe, lo creamos en Facturapi + DB
+  if (!localCustomer) {
+    const created = await facturapi.customers.create({
+      legal_name: customer.legalName,
+      tax_id: customer.taxId,
+      tax_system: String(customer.taxSystem),
+      email: customer.email,
+      address: customer.address, // mínimo { zip }
+    });
+
+    const ins = await db.query(
+      `insert into public.customers (tax_id, legal_name, tax_system, email, zip, facturapi_customer_id)
+       values ($1,$2,$3,$4,$5,$6)
+       returning *`,
+      [
+        String(customer.taxId),
+        String(customer.legalName),
+        String(customer.taxSystem),
+        String(customer.email),
+        String(customer.address?.zip || ""),
+        created.id,
+      ]
+    );
+    localCustomer = ins.rows[0];
+  } else {
+    // existe: si no tiene facturapi_customer_id, créalo; si tiene, opcionalmente actualiza datos
+    let facturapiCustomerId = localCustomer.facturapi_customer_id;
+
+    if (!facturapiCustomerId) {
+      const created = await facturapi.customers.create({
+        legal_name: customer.legalName,
+        tax_id: customer.taxId,
+        tax_system: String(customer.taxSystem),
+        email: customer.email,
+        address: customer.address,
+      });
+      facturapiCustomerId = created.id;
+    } else {
+      // opcional: mantener datos actualizados en Facturapi
+      await facturapi.customers.update(facturapiCustomerId, {
+        legal_name: customer.legalName,
+        tax_system: String(customer.taxSystem),
+        email: customer.email,
+        address: customer.address,
+      });
+    }
+
+    // actualiza DB local customers
+    const upd = await db.query(
+      `update public.customers
+       set legal_name=$2, tax_system=$3, email=$4, zip=$5, facturapi_customer_id=$6, updated_at=now()
+       where id=$1
+       returning *`,
+      [
+        localCustomer.id,
+        String(customer.legalName),
+        String(customer.taxSystem),
+        String(customer.email),
+        String(customer.address?.zip || ""),
+        facturapiCustomerId,
+      ]
+    );
+    localCustomer = upd.rows[0];
+  }
+
+  // 6) Crear invoice
   const total = Number(order.total || 0);
 
   const invoice = await facturapi.invoices.create({
-    customer: createdCustomer.id,
+    customer: localCustomer.facturapi_customer_id,
     payment_form: paymentForm || "03",
     use: cfdiUse || "G03",
     items: [
@@ -117,23 +220,36 @@ app.post("/api/invoices", async (req, res) => {
         quantity: 1,
         product: {
           product_key: "90101501",
-          description: `Consumo restaurante - numcheque ${order.numcheque}`,
+          description: `Consumo Cantina La Llorona - numcheque ${order.numcheque}`,
           price: total,
         },
       },
     ],
   });
 
-  const ins = await db.query(
-    `insert into public.invoices (order_id, facturapi_invoice_id) values ($1,$2) returning id`,
-    [orderId, invoice.id]
+  // 7) Guardar invoice en DB
+  const insInv = await db.query(
+    `insert into public.invoices (order_id, facturapi_invoice_id, customer_id)
+     values ($1,$2,$3)
+     returning id`,
+    [orderId, invoice.id, localCustomer.id]
   );
+
+  const invoiceId = insInv.rows[0].id;
+
+  // 8) Enviar automáticamente por email
+  await facturapi.invoices.sendByEmail(invoice.id);
+  await db.query(`update public.invoices set emailed_at=now() where id=$1`, [
+    invoiceId,
+  ]);
 
   return res.json({
     ok: true,
-    invoiceId: ins.rows[0].id,
-    pdfUrl: `/api/invoices/${ins.rows[0].id}/pdf`,
-    zipUrl: `/api/invoices/${ins.rows[0].id}/zip`,
+    alreadyInvoiced: false,
+    invoiceId,
+    pdfUrl: `/api/invoices/${invoiceId}/pdf`,
+    zipUrl: `/api/invoices/${invoiceId}/zip`,
+    emailed: true,
   });
 });
 
@@ -189,6 +305,7 @@ app.get("/api/invoices/:id/pdf", async (req, res) => {
     `select * from public.invoices where id=$1 limit 1`,
     [id]
   );
+  console.log(r);
   if (!r.rows.length)
     return res.status(404).json({ error: "Invoice no encontrada" });
 
