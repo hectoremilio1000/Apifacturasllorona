@@ -3,6 +3,8 @@ const express = require("express");
 const cors = require("cors");
 const { Client } = require("pg");
 const Facturapi = require("facturapi").default;
+const ftp = require("basic-ftp");
+
 const { DateTime } = require("luxon");
 const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
@@ -15,6 +17,113 @@ function fp() {
   if (!process.env.FACTURAPI_KEY) throw new Error("Missing FACTURAPI_KEY");
   return new Facturapi(process.env.FACTURAPI_KEY);
 }
+async function uploadInvoiceFilesToFtp({
+  invoiceId,
+  pdfStream,
+  xmlStream,
+  zipStream,
+}) {
+  const host = process.env.FTP_HOST;
+  const user = process.env.FTP_USER;
+  const password = process.env.FTP_PASS;
+  const port = Number(process.env.FTP_PORT || 21);
+  const secure = String(process.env.FTP_SECURE || "false") === "true";
+
+  if (!host || !user || !password)
+    throw new Error("Missing FTP env vars (FTP_HOST/FTP_USER/FTP_PASS)");
+
+  const baseDir = process.env.FTP_BASE_DIR || "/facturasllorona";
+  const mediaBase = process.env.MEDIA_BASE_URL || "";
+
+  const remoteDir = `${baseDir}/${invoiceId}`;
+  const pdfName = "invoice.pdf";
+  const xmlName = "invoice.xml";
+  const zipName = "invoice.zip";
+
+  const client = new ftp.Client();
+  client.ftp.verbose = false;
+
+  try {
+    await client.access({ host, user, password, port, secure });
+    await client.ensureDir(remoteDir);
+    await client.cd(remoteDir);
+
+    // basic-ftp acepta streams en uploadFrom
+    await client.uploadFrom(pdfStream, pdfName);
+    await client.uploadFrom(xmlStream, xmlName);
+    await client.uploadFrom(zipStream, zipName);
+
+    const pdfUrl = mediaBase ? `${mediaBase}/${invoiceId}/${pdfName}` : null;
+    const xmlUrl = mediaBase ? `${mediaBase}/${invoiceId}/${xmlName}` : null;
+    const zipUrl = mediaBase ? `${mediaBase}/${invoiceId}/${zipName}` : null;
+
+    return { pdfUrl, xmlUrl, zipUrl };
+  } finally {
+    client.close();
+  }
+}
+
+function requireAdmin(req, res, next) {
+  const token = req.header("x-admin-token");
+  if (!process.env.ADMIN_TOKEN)
+    return res.status(500).json({ error: "Missing ADMIN_TOKEN" });
+  if (token !== process.env.ADMIN_TOKEN)
+    return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
+
+// rutas admin
+app.get("/api/admin/invoices", requireAdmin, async (req, res) => {
+  const q = String(req.query.q || "").trim(); // numcheque
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const offset = Math.max(Number(req.query.offset || 0), 0);
+
+  const sqlText = `
+    select
+      i.id as "invoiceId",
+      i.order_id as "orderId",
+      i.facturapi_invoice_id as "facturapiInvoiceId",
+      i.created_at as "createdAt",
+      i.emailed_at as "emailedAt",
+      i.uploaded_at as "uploadedAt",
+      i.media_pdf_url as "mediaPdfUrl",
+      i.media_xml_url as "mediaXmlUrl",
+      i.media_zip_url as "mediaZipUrl",
+      o.folio,
+      o.numcheque,
+      o.fecha,
+      o.total,
+      c.id as "customerId",
+      c.tax_id as "taxId",
+      c.legal_name as "legalName",
+      c.email
+    from public.invoices i
+    join public.orders o on o.id = i.order_id
+    left join public.customers c on c.id = i.customer_id
+    where ($1 = '' or o.numcheque ilike '%' || $1 || '%')
+    order by i.id desc
+    limit $2 offset $3
+  `;
+  const r = await db.query(sqlText, [q, limit, offset]);
+  res.json({ rows: r.rows });
+});
+app.get("/api/admin/customers", requireAdmin, async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const limit = Math.min(Number(req.query.limit || 50), 200);
+  const offset = Math.max(Number(req.query.offset || 0), 0);
+
+  const sqlText = `
+    select id, tax_id as "taxId", legal_name as "legalName", tax_system as "taxSystem",
+           email, zip, facturapi_customer_id as "facturapiCustomerId",
+           created_at as "createdAt", updated_at as "updatedAt"
+    from public.customers
+    where ($1 = '' or tax_id ilike '%'||$1||'%' or legal_name ilike '%'||$1||'%' or email ilike '%'||$1||'%')
+    order by id desc
+    limit $2 offset $3
+  `;
+  const r = await db.query(sqlText, [q, limit, offset]);
+  res.json({ rows: r.rows });
+});
 
 /**
  * Lookup por:
@@ -242,6 +351,30 @@ app.post("/api/invoices", async (req, res) => {
   await db.query(`update public.invoices set emailed_at=now() where id=$1`, [
     invoiceId,
   ]);
+  // Descarga streams desde Facturapi
+  const pdfStream = await facturapi.invoices.downloadPdf(invoice.id);
+  const xmlStream = await facturapi.invoices.downloadXml(invoice.id);
+  const zipStream = await facturapi.invoices.downloadZip(invoice.id);
+
+  // Subir a FTP: /facturasllorona/<invoiceId>/{invoice.pdf,invoice.xml,invoice.zip}
+  try {
+    const uploaded = await uploadInvoiceFilesToFtp({
+      invoiceId,
+      pdfStream,
+      xmlStream,
+      zipStream,
+    });
+
+    await db.query(
+      `update public.invoices
+     set media_pdf_url=$2, media_xml_url=$3, media_zip_url=$4, uploaded_at=now()
+     where id=$1`,
+      [invoiceId, uploaded.pdfUrl, uploaded.xmlUrl, uploaded.zipUrl]
+    );
+  } catch (e) {
+    console.error("[ftp-upload] failed", e);
+    // No rompemos el flujo: la factura ya existe y ya se envió por correo.
+  }
 
   return res.json({
     ok: true,
@@ -295,6 +428,28 @@ app.get("/api/invoices/:id/zip", async (req, res) => {
   );
   zipStream.pipe(res);
 });
+app.get("/api/invoices/:id/xml", async (req, res) => {
+  const id = Number(req.params.id);
+
+  const r = await db.query(
+    `select * from public.invoices where id=$1 limit 1`,
+    [id]
+  );
+  if (!r.rows.length)
+    return res.status(404).json({ error: "Invoice no encontrada" });
+
+  const facturapi = fp();
+  const xmlStream = await facturapi.invoices.downloadXml(
+    r.rows[0].facturapi_invoice_id
+  );
+
+  res.setHeader("Content-Type", "application/xml");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="factura_${id}.xml"`
+  );
+  xmlStream.pipe(res);
+});
 
 /**
  * PDF stream
@@ -305,17 +460,20 @@ app.get("/api/invoices/:id/pdf", async (req, res) => {
     `select * from public.invoices where id=$1 limit 1`,
     [id]
   );
-  console.log(r);
-  if (!r.rows.length)
+  if (r.rows.length === 0)
     return res.status(404).json({ error: "Invoice no encontrada" });
 
   const facturapi = fp();
+  console.log(r.rows[0].facturapi_invoice_id);
   const pdfStream = await facturapi.invoices.downloadPdf(
     r.rows[0].facturapi_invoice_id
   );
 
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `inline; filename="factura_${id}.pdf"`);
+  res.setHeader(
+    "Content-Disposition",
+    `inline; filename="factura_${r.rows[0].facturapi_invoice_id}.pdf"`
+  );
   pdfStream.pipe(res);
 });
 
