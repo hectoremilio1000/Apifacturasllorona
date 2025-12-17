@@ -74,9 +74,36 @@ function requireAdmin(req, res, next) {
 
 // rutas admin
 app.get("/api/admin/invoices", requireAdmin, async (req, res) => {
-  const q = String(req.query.q || "").trim(); // numcheque
+  const tz = process.env.RESTAURANT_TZ || "America/Mexico_City";
+
+  // filtros
+  const numcheque = String(req.query.numcheque || "").trim();
+  const customerQ = String(req.query.customerQ || "").trim(); // RFC / razón / email
+  const folio = String(req.query.folio || "").trim();
+
+  // fechas vienen como YYYY-MM-DD (hora local MX)
+  const dateFrom = String(req.query.dateFrom || "").trim();
+  const dateTo = String(req.query.dateTo || "").trim();
+
   const limit = Math.min(Number(req.query.limit || 50), 200);
   const offset = Math.max(Number(req.query.offset || 0), 0);
+
+  let startUtc = null;
+  let endUtc = null;
+
+  if (dateFrom) {
+    const start = DateTime.fromISO(dateFrom, { zone: tz })
+      .startOf("day")
+      .toUTC();
+    startUtc = start.toISO();
+
+    const to = dateTo || dateFrom; // si solo manda dateFrom, usamos ese mismo día
+    const end = DateTime.fromISO(to, { zone: tz })
+      .startOf("day")
+      .toUTC()
+      .plus({ days: 1 });
+    endUtc = end.toISO();
+  }
 
   const sqlText = `
     select
@@ -89,40 +116,77 @@ app.get("/api/admin/invoices", requireAdmin, async (req, res) => {
       i.media_pdf_url as "mediaPdfUrl",
       i.media_xml_url as "mediaXmlUrl",
       i.media_zip_url as "mediaZipUrl",
+
       o.folio,
       o.numcheque,
       o.fecha,
       o.total,
+
       c.id as "customerId",
       c.tax_id as "taxId",
       c.legal_name as "legalName",
       c.email
+
     from public.invoices i
     join public.orders o on o.id = i.order_id
     left join public.customers c on c.id = i.customer_id
-    where ($1 = '' or o.numcheque ilike '%' || $1 || '%')
+    where
+      ($1 = '' or o.numcheque ilike '%' || $1 || '%')
+      and ($2 = '' or o.folio ilike '%' || $2 || '%')
+      and (
+        $3 = '' or
+        c.tax_id ilike '%' || $3 || '%' or
+        c.legal_name ilike '%' || $3 || '%' or
+        c.email ilike '%' || $3 || '%'
+      )
+      and ($4::timestamptz is null or o.fecha >= $4::timestamptz)
+      and ($5::timestamptz is null or o.fecha <  $5::timestamptz)
     order by i.id desc
-    limit $2 offset $3
+    limit $6 offset $7
   `;
-  const r = await db.query(sqlText, [q, limit, offset]);
-  res.json({ rows: r.rows });
+
+  const r = await db.query(sqlText, [
+    numcheque,
+    folio,
+    customerQ,
+    startUtc,
+    endUtc,
+    limit,
+    offset,
+  ]);
+
+  res.json({ rows: r.rows, limit, offset });
 });
+
 app.get("/api/admin/customers", requireAdmin, async (req, res) => {
   const q = String(req.query.q || "").trim();
   const limit = Math.min(Number(req.query.limit || 50), 200);
   const offset = Math.max(Number(req.query.offset || 0), 0);
 
   const sqlText = `
-    select id, tax_id as "taxId", legal_name as "legalName", tax_system as "taxSystem",
-           email, zip, facturapi_customer_id as "facturapiCustomerId",
-           created_at as "createdAt", updated_at as "updatedAt"
+    select
+      id,
+      tax_id as "taxId",
+      legal_name as "legalName",
+      tax_system as "taxSystem",
+      email,
+      zip,
+      facturapi_customer_id as "facturapiCustomerId",
+      created_at as "createdAt",
+      updated_at as "updatedAt"
     from public.customers
-    where ($1 = '' or tax_id ilike '%'||$1||'%' or legal_name ilike '%'||$1||'%' or email ilike '%'||$1||'%')
+    where
+      ($1 = '' or
+        tax_id ilike '%'||$1||'%' or
+        legal_name ilike '%'||$1||'%' or
+        email ilike '%'||$1||'%'
+      )
     order by id desc
     limit $2 offset $3
   `;
+
   const r = await db.query(sqlText, [q, limit, offset]);
-  res.json({ rows: r.rows });
+  res.json({ rows: r.rows, limit, offset });
 });
 
 /**
