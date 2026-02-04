@@ -13,6 +13,91 @@ app.use(express.json({ limit: "2mb" }));
 const db = new Client({ connectionString: process.env.DATABASE_URL });
 db.connect().then(() => console.log("[db] connected"));
 
+function sendApiError(res, status, payload) {
+  return res.status(status).json({
+    ok: false,
+    code: payload.code || "UNKNOWN_ERROR",
+    error: payload.error || "Ocurrió un error",
+    userMessage: payload.userMessage || payload.error || "Ocurrió un error",
+    details: payload.details || null,
+  });
+}
+
+function normalizeTextForSat(str) {
+  // Ayuda para hint, NO modifica tu DB automáticamente (solo mensaje al usuario)
+  return String(str || "")
+    .toUpperCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // quita acentos
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractFacturapiError(e) {
+  // Facturapi a veces trae e.message, a veces e.response?.data
+  const rawMessage =
+    e?.response?.data?.message ||
+    e?.response?.data?.error ||
+    e?.message ||
+    "Error en Facturapi";
+
+  const msg = String(rawMessage);
+
+  // Caso típico SAT (CFDI 4.0): razón social no coincide con RFC
+  if (msg.includes("no coincide con el RFC registrado en el SAT")) {
+    return {
+      httpStatus: 400,
+      code: "SAT_NAME_MISMATCH",
+      error: "Los datos del receptor no coinciden con el SAT.",
+      userMessage:
+        "Tu nombre o razón social no coincide con tu RFC ante el SAT. Captúralo EXACTO como aparece en tu Constancia de Situación Fiscal.",
+      details: {
+        hint: "En CFDI 4.0: usa MAYÚSCULAS, SIN ACENTOS y SIN régimen societario (ej: no incluir “S.A. DE C.V.”).",
+        raw: msg,
+      },
+    };
+  }
+
+  // Otros errores comunes que puedes mapear si quieres:
+  if (
+    msg.toLowerCase().includes("tax_id") ||
+    msg.toLowerCase().includes("rfc")
+  ) {
+    return {
+      httpStatus: 400,
+      code: "RFC_INVALID",
+      error: "RFC inválido.",
+      userMessage:
+        "El RFC parece inválido. Verifica que esté escrito correctamente (sin espacios) y que corresponda al contribuyente.",
+      details: { raw: msg },
+    };
+  }
+
+  if (
+    msg.toLowerCase().includes("zip") ||
+    msg.toLowerCase().includes("código postal")
+  ) {
+    return {
+      httpStatus: 400,
+      code: "ZIP_INVALID",
+      error: "Código postal inválido.",
+      userMessage:
+        "El código postal no es válido. Captura el CP exactamente como aparece en tu Constancia Fiscal.",
+      details: { raw: msg },
+    };
+  }
+
+  // Default
+  return {
+    httpStatus: 500,
+    code: "FACTURAPI_ERROR",
+    error: "No se pudo generar la factura.",
+    userMessage:
+      "No se pudo generar la factura por un problema de validación. Revisa tus datos fiscales e inténtalo de nuevo.",
+    details: { raw: msg },
+  };
+}
+
 function fp() {
   if (!process.env.FACTURAPI_KEY) throw new Error("Missing FACTURAPI_KEY");
   return new Facturapi(process.env.FACTURAPI_KEY);
@@ -207,7 +292,7 @@ app.post("/api/admin/invoices/:id/cancel", requireAdmin, async (req, res) => {
   // 1) carga invoice local
   const r = await db.query(
     `select * from public.invoices where id=$1 limit 1`,
-    [id]
+    [id],
   );
   if (!r.rows.length)
     return res.status(404).json({ error: "Invoice no encontrada" });
@@ -223,7 +308,7 @@ app.post("/api/admin/invoices/:id/cancel", requireAdmin, async (req, res) => {
   if (!key) return res.status(500).json({ error: "Missing FACTURAPI_KEY" });
 
   const url = new URL(
-    `https://www.facturapi.io/v2/invoices/${inv.facturapi_invoice_id}`
+    `https://www.facturapi.io/v2/invoices/${inv.facturapi_invoice_id}`,
   );
   url.searchParams.set("motive", String(motive));
   if (substitution) url.searchParams.set("substitution", String(substitution));
@@ -268,7 +353,7 @@ app.post("/api/admin/invoices/:id/cancel", requireAdmin, async (req, res) => {
       newUuid,
       String(motive),
       substitution ? String(substitution) : null,
-    ]
+    ],
   );
 
   return res.json({ ok: true, facturapi: data, invoice: upd.rows[0] });
@@ -278,7 +363,7 @@ app.post("/api/admin/invoices/:id/refresh", requireAdmin, async (req, res) => {
 
   const r = await db.query(
     `select * from public.invoices where id=$1 limit 1`,
-    [id]
+    [id],
   );
   if (!r.rows.length)
     return res.status(404).json({ error: "Invoice no encontrada" });
@@ -291,7 +376,7 @@ app.post("/api/admin/invoices/:id/refresh", requireAdmin, async (req, res) => {
     `https://www.facturapi.io/v2/invoices/${inv.facturapi_invoice_id}`,
     {
       headers: { Authorization: `Bearer ${key}` },
-    }
+    },
   );
 
   const data = await resp.json().catch(() => null);
@@ -316,7 +401,7 @@ app.post("/api/admin/invoices/:id/refresh", requireAdmin, async (req, res) => {
     where id = $1
     returning *
     `,
-    [id, newStatus, newCancellationStatus, newUuid]
+    [id, newStatus, newCancellationStatus, newUuid],
   );
 
   return res.json({ ok: true, facturapi: data, invoice: upd.rows[0] });
@@ -388,211 +473,235 @@ async function verifyRecaptcha(token) {
 }
 
 app.post("/api/invoices", async (req, res) => {
-  const { orderId, customer, cfdiUse, paymentForm, recaptchaToken } =
-    req.body || {};
+  try {
+    const { orderId, customer, cfdiUse, paymentForm, recaptchaToken } =
+      req.body || {};
 
-  // 1) reCAPTCHA
-  const okCaptcha = await verifyRecaptcha(recaptchaToken);
-  if (!okCaptcha)
-    return res
-      .status(400)
-      .json({ error: "reCAPTCHA inválido. Intenta de nuevo." });
-
-  // 2) Validaciones (email obligatorio)
-  if (
-    !orderId ||
-    !customer?.taxId ||
-    !customer?.legalName ||
-    !customer?.taxSystem ||
-    !customer?.email
-  ) {
-    return res.status(400).json({
-      error: "Faltan campos requeridos (incluye email y régimen fiscal)",
-    });
-  }
-  if (String(customer.taxSystem).length !== 3) {
-    return res
-      .status(400)
-      .json({ error: "taxSystem debe ser de 3 caracteres (ej: 601)" });
-  }
-
-  // 3) Order existe
-  const ord = await db.query(
-    `select * from public.orders where id=$1 limit 1`,
-    [orderId]
-  );
-  if (!ord.rows.length)
-    return res.status(404).json({ error: "Order no encontrado" });
-  const order = ord.rows[0];
-
-  // 4) ¿Ya facturada? -> NO permitir llenar datos, solo devolver PDF/ZIP
-  const ex = await db.query(
-    `select * from public.invoices where order_id=$1 limit 1`,
-    [orderId]
-  );
-  if (ex.rows.length) {
-    return res.json({
-      ok: true,
-      alreadyInvoiced: true,
-      invoiceId: ex.rows[0].id,
-      pdfUrl: `/api/invoices/${ex.rows[0].id}/pdf`,
-      zipUrl: `/api/invoices/${ex.rows[0].id}/zip`,
-    });
-  }
-
-  const facturapi = fp();
-
-  // 5) Upsert customer en DB (buscar por tax_id)
-  let customerRow = await db.query(
-    `select * from public.customers where tax_id=$1 limit 1`,
-    [String(customer.taxId)]
-  );
-  let localCustomer = customerRow.rows[0];
-
-  // Si no existe, lo creamos en Facturapi + DB
-  if (!localCustomer) {
-    const created = await facturapi.customers.create({
-      legal_name: customer.legalName,
-      tax_id: customer.taxId,
-      tax_system: String(customer.taxSystem),
-      email: customer.email,
-      address: customer.address, // mínimo { zip }
-    });
-
-    const ins = await db.query(
-      `insert into public.customers (tax_id, legal_name, tax_system, email, zip, facturapi_customer_id)
-       values ($1,$2,$3,$4,$5,$6)
-       returning *`,
-      [
-        String(customer.taxId),
-        String(customer.legalName),
-        String(customer.taxSystem),
-        String(customer.email),
-        String(customer.address?.zip || ""),
-        created.id,
-      ]
-    );
-    localCustomer = ins.rows[0];
-  } else {
-    // existe: si no tiene facturapi_customer_id, créalo; si tiene, opcionalmente actualiza datos
-    let facturapiCustomerId = localCustomer.facturapi_customer_id;
-
-    if (!facturapiCustomerId) {
-      const created = await facturapi.customers.create({
-        legal_name: customer.legalName,
-        tax_id: customer.taxId,
-        tax_system: String(customer.taxSystem),
-        email: customer.email,
-        address: customer.address,
-      });
-      facturapiCustomerId = created.id;
-    } else {
-      // opcional: mantener datos actualizados en Facturapi
-      await facturapi.customers.update(facturapiCustomerId, {
-        legal_name: customer.legalName,
-        tax_system: String(customer.taxSystem),
-        email: customer.email,
-        address: customer.address,
+    // 1) reCAPTCHA
+    const okCaptcha = await verifyRecaptcha(recaptchaToken);
+    if (!okCaptcha) {
+      return sendApiError(res, 400, {
+        code: "RECAPTCHA_INVALID",
+        error: "reCAPTCHA inválido. Intenta de nuevo.",
+        userMessage:
+          "La verificación anti-robot expiró o no fue válida. Marca la casilla nuevamente e inténtalo.",
       });
     }
 
-    // actualiza DB local customers
-    const upd = await db.query(
-      `update public.customers
-       set legal_name=$2, tax_system=$3, email=$4, zip=$5, facturapi_customer_id=$6, updated_at=now()
-       where id=$1
-       returning *`,
-      [
-        localCustomer.id,
-        String(customer.legalName),
-        String(customer.taxSystem),
-        String(customer.email),
-        String(customer.address?.zip || ""),
-        facturapiCustomerId,
-      ]
-    );
-    localCustomer = upd.rows[0];
-  }
-
-  // 6) Crear invoice
-  const total = Number(order.total || 0);
-
-  const invoice = await facturapi.invoices.create({
-    customer: localCustomer.facturapi_customer_id,
-    payment_form: paymentForm || "03",
-    use: cfdiUse || "G03",
-    items: [
-      {
-        quantity: 1,
-        product: {
-          product_key: "90101501",
-          description: `Consumo Cantina La Llorona - numcheque ${order.numcheque}`,
-          price: total,
+    // 2) Validaciones
+    if (
+      !orderId ||
+      !customer?.taxId ||
+      !customer?.legalName ||
+      !customer?.taxSystem ||
+      !customer?.email
+    ) {
+      return sendApiError(res, 400, {
+        code: "VALIDATION_ERROR",
+        error: "Faltan campos requeridos (incluye email y régimen fiscal).",
+        userMessage:
+          "Faltan datos fiscales obligatorios. Revisa RFC, Razón Social, Régimen y Email.",
+        details: {
+          fields: ["orderId", "taxId", "legalName", "taxSystem", "email"],
         },
-      },
-    ],
-  });
-  const facturapiStatus = invoice.status || null;
-  const facturapiCancellationStatus = invoice.cancellation_status || "none";
-  const facturapiUuid = invoice.uuid || null;
+      });
+    }
 
-  // 7) Guardar invoice en DB
+    if (String(customer.taxSystem).length !== 3) {
+      return sendApiError(res, 400, {
+        code: "TAX_SYSTEM_INVALID",
+        error: "taxSystem debe ser de 3 caracteres (ej: 601).",
+        userMessage: "Selecciona un régimen fiscal válido.",
+      });
+    }
 
-  const insInv = await db.query(
-    `insert into public.invoices
-     (order_id, facturapi_invoice_id, customer_id, facturapi_status, facturapi_cancellation_status, facturapi_uuid)
-   values ($1,$2,$3,$4,$5,$6)
-   returning id`,
-    [
-      orderId,
-      invoice.id,
-      localCustomer.id,
-      facturapiStatus,
-      facturapiCancellationStatus,
-      facturapiUuid,
-    ]
-  );
+    // 3) Order existe
+    const ord = await db.query(
+      `select * from public.orders where id=$1 limit 1`,
+      [orderId],
+    );
+    if (!ord.rows.length) {
+      return sendApiError(res, 404, {
+        code: "ORDER_NOT_FOUND",
+        error: "Order no encontrado.",
+        userMessage:
+          "No encontramos ese consumo. Verifica fecha y folio/numcheque.",
+      });
+    }
+    const order = ord.rows[0];
 
-  const invoiceId = insInv.rows[0].id;
+    // 4) Ya facturada
+    const ex = await db.query(
+      `select * from public.invoices where order_id=$1 limit 1`,
+      [orderId],
+    );
+    if (ex.rows.length) {
+      return res.json({
+        ok: true,
+        alreadyInvoiced: true,
+        invoiceId: ex.rows[0].id,
+        pdfUrl: `/api/invoices/${ex.rows[0].id}/pdf`,
+        zipUrl: `/api/invoices/${ex.rows[0].id}/zip`,
+      });
+    }
 
-  // 8) Enviar automáticamente por email
-  await facturapi.invoices.sendByEmail(invoice.id);
-  await db.query(`update public.invoices set emailed_at=now() where id=$1`, [
-    invoiceId,
-  ]);
-  // Descarga streams desde Facturapi
-  const pdfStream = await facturapi.invoices.downloadPdf(invoice.id);
-  const xmlStream = await facturapi.invoices.downloadXml(invoice.id);
-  const zipStream = await facturapi.invoices.downloadZip(invoice.id);
+    const facturapi = fp();
 
-  // Subir a FTP: /facturasllorona/<invoiceId>/{invoice.pdf,invoice.xml,invoice.zip}
-  try {
-    const uploaded = await uploadInvoiceFilesToFtp({
-      invoiceId,
-      pdfStream,
-      xmlStream,
-      zipStream,
+    // 5) Upsert customer en DB
+    let customerRow = await db.query(
+      `select * from public.customers where tax_id=$1 limit 1`,
+      [String(customer.taxId)],
+    );
+    let localCustomer = customerRow.rows[0];
+
+    // Normalización (solo para enviar a Facturapi y ayudar a SAT)
+    const legalNameSat = normalizeTextForSat(customer.legalName);
+
+    if (!localCustomer) {
+      const created = await facturapi.customers.create({
+        legal_name: legalNameSat,
+        tax_id: customer.taxId,
+        tax_system: String(customer.taxSystem),
+        email: customer.email,
+        address: customer.address, // mínimo { zip }
+      });
+
+      const ins = await db.query(
+        `insert into public.customers (tax_id, legal_name, tax_system, email, zip, facturapi_customer_id)
+         values ($1,$2,$3,$4,$5,$6)
+         returning *`,
+        [
+          String(customer.taxId),
+          legalNameSat,
+          String(customer.taxSystem),
+          String(customer.email),
+          String(customer.address?.zip || ""),
+          created.id,
+        ],
+      );
+      localCustomer = ins.rows[0];
+    } else {
+      let facturapiCustomerId = localCustomer.facturapi_customer_id;
+
+      if (!facturapiCustomerId) {
+        const created = await facturapi.customers.create({
+          legal_name: legalNameSat,
+          tax_id: customer.taxId,
+          tax_system: String(customer.taxSystem),
+          email: customer.email,
+          address: customer.address,
+        });
+        facturapiCustomerId = created.id;
+      } else {
+        await facturapi.customers.update(facturapiCustomerId, {
+          legal_name: legalNameSat,
+          tax_system: String(customer.taxSystem),
+          email: customer.email,
+          address: customer.address,
+        });
+      }
+
+      const upd = await db.query(
+        `update public.customers
+         set legal_name=$2, tax_system=$3, email=$4, zip=$5, facturapi_customer_id=$6, updated_at=now()
+         where id=$1
+         returning *`,
+        [
+          localCustomer.id,
+          legalNameSat,
+          String(customer.taxSystem),
+          String(customer.email),
+          String(customer.address?.zip || ""),
+          facturapiCustomerId,
+        ],
+      );
+      localCustomer = upd.rows[0];
+    }
+
+    // 6) Crear invoice
+    const total = Number(order.total || 0);
+
+    const invoice = await facturapi.invoices.create({
+      customer: localCustomer.facturapi_customer_id,
+      payment_form: paymentForm || "03",
+      use: cfdiUse || "G03",
+      items: [
+        {
+          quantity: 1,
+          product: {
+            product_key: "90101501",
+            description: `Consumo Cantina La Llorona - numcheque ${order.numcheque}`,
+            price: total,
+          },
+        },
+      ],
     });
 
-    await db.query(
-      `update public.invoices
-     set media_pdf_url=$2, media_xml_url=$3, media_zip_url=$4, uploaded_at=now()
-     where id=$1`,
-      [invoiceId, uploaded.pdfUrl, uploaded.xmlUrl, uploaded.zipUrl]
-    );
-  } catch (e) {
-    console.error("[ftp-upload] failed", e);
-    // No rompemos el flujo: la factura ya existe y ya se envió por correo.
-  }
+    const facturapiStatus = invoice.status || null;
+    const facturapiCancellationStatus = invoice.cancellation_status || "none";
+    const facturapiUuid = invoice.uuid || null;
 
-  return res.json({
-    ok: true,
-    alreadyInvoiced: false,
-    invoiceId,
-    pdfUrl: `/api/invoices/${invoiceId}/pdf`,
-    zipUrl: `/api/invoices/${invoiceId}/zip`,
-    emailed: true,
-  });
+    // 7) Guardar invoice en DB
+    const insInv = await db.query(
+      `insert into public.invoices
+       (order_id, facturapi_invoice_id, customer_id, facturapi_status, facturapi_cancellation_status, facturapi_uuid)
+       values ($1,$2,$3,$4,$5,$6)
+       returning id`,
+      [
+        orderId,
+        invoice.id,
+        localCustomer.id,
+        facturapiStatus,
+        facturapiCancellationStatus,
+        facturapiUuid,
+      ],
+    );
+
+    const invoiceId = insInv.rows[0].id;
+
+    // 8) Enviar email
+    await facturapi.invoices.sendByEmail(invoice.id);
+    await db.query(`update public.invoices set emailed_at=now() where id=$1`, [
+      invoiceId,
+    ]);
+
+    // 9) FTP (no rompe flujo)
+    try {
+      const pdfStream = await facturapi.invoices.downloadPdf(invoice.id);
+      const xmlStream = await facturapi.invoices.downloadXml(invoice.id);
+      const zipStream = await facturapi.invoices.downloadZip(invoice.id);
+
+      const uploaded = await uploadInvoiceFilesToFtp({
+        invoiceId,
+        pdfStream,
+        xmlStream,
+        zipStream,
+      });
+
+      await db.query(
+        `update public.invoices
+         set media_pdf_url=$2, media_xml_url=$3, media_zip_url=$4, uploaded_at=now()
+         where id=$1`,
+        [invoiceId, uploaded.pdfUrl, uploaded.xmlUrl, uploaded.zipUrl],
+      );
+    } catch (e) {
+      console.error("[ftp-upload] failed", e);
+    }
+
+    return res.json({
+      ok: true,
+      alreadyInvoiced: false,
+      invoiceId,
+      pdfUrl: `/api/invoices/${invoiceId}/pdf`,
+      zipUrl: `/api/invoices/${invoiceId}/zip`,
+      emailed: true,
+    });
+  } catch (e) {
+    // 👇 aquí atrapamos TODO (incluye Facturapi)
+    const mapped = extractFacturapiError(e);
+    console.error("[api/invoices] error:", e);
+    return sendApiError(res, mapped.httpStatus || 500, mapped);
+  }
 });
 
 // POST /api/invoices/:id/send-email
@@ -601,7 +710,7 @@ app.post("/api/invoices/:id/send-email", async (req, res) => {
 
   const r = await db.query(
     `select * from public.invoices where id=$1 limit 1`,
-    [id]
+    [id],
   );
   if (!r.rows.length)
     return res.status(404).json({ error: "Invoice no encontrada" });
@@ -620,7 +729,7 @@ app.get("/api/invoices/:id/zip", async (req, res) => {
 
   const r = await db.query(
     `select * from public.invoices where id=$1 limit 1`,
-    [id]
+    [id],
   );
   if (!r.rows.length)
     return res.status(404).json({ error: "Invoice no encontrada" });
@@ -633,7 +742,7 @@ app.get("/api/invoices/:id/zip", async (req, res) => {
   res.setHeader("Content-Type", "application/zip");
   res.setHeader(
     "Content-Disposition",
-    `attachment; filename="factura_${id}.zip"`
+    `attachment; filename="factura_${id}.zip"`,
   );
   zipStream.pipe(res);
 });
@@ -642,20 +751,20 @@ app.get("/api/invoices/:id/xml", async (req, res) => {
 
   const r = await db.query(
     `select * from public.invoices where id=$1 limit 1`,
-    [id]
+    [id],
   );
   if (!r.rows.length)
     return res.status(404).json({ error: "Invoice no encontrada" });
 
   const facturapi = fp();
   const xmlStream = await facturapi.invoices.downloadXml(
-    r.rows[0].facturapi_invoice_id
+    r.rows[0].facturapi_invoice_id,
   );
 
   res.setHeader("Content-Type", "application/xml");
   res.setHeader(
     "Content-Disposition",
-    `attachment; filename="factura_${id}.xml"`
+    `attachment; filename="factura_${id}.xml"`,
   );
   xmlStream.pipe(res);
 });
@@ -667,7 +776,7 @@ app.get("/api/invoices/:id/pdf", async (req, res) => {
   const id = Number(req.params.id);
   const r = await db.query(
     `select * from public.invoices where id=$1 limit 1`,
-    [id]
+    [id],
   );
   if (r.rows.length === 0)
     return res.status(404).json({ error: "Invoice no encontrada" });
@@ -675,18 +784,27 @@ app.get("/api/invoices/:id/pdf", async (req, res) => {
   const facturapi = fp();
   console.log(r.rows[0].facturapi_invoice_id);
   const pdfStream = await facturapi.invoices.downloadPdf(
-    r.rows[0].facturapi_invoice_id
+    r.rows[0].facturapi_invoice_id,
   );
 
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader(
     "Content-Disposition",
-    `inline; filename="factura_${r.rows[0].facturapi_invoice_id}.pdf"`
+    `inline; filename="factura_${r.rows[0].facturapi_invoice_id}.pdf"`,
   );
   pdfStream.pipe(res);
 });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
+app.use((err, req, res, next) => {
+  console.error("[unhandled]", err);
+  return sendApiError(res, 500, {
+    code: "UNHANDLED_ERROR",
+    error: "Error interno",
+    userMessage:
+      "Ocurrió un error inesperado. Intenta de nuevo y si persiste contacta a administración.",
+  });
+});
 
 app.listen(Number(process.env.PORT || 3000), () => {
   console.log(`[api] listening on :${process.env.PORT || 3000}`);
