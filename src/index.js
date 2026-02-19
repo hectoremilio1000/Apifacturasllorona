@@ -10,8 +10,24 @@ const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "2mb" }));
 
-const db = new Client({ connectionString: process.env.DATABASE_URL });
-db.connect().then(() => console.log("[db] connected"));
+const db = new Client({
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    process.env.NODE_ENV === "production"
+      ? { rejectUnauthorized: false }
+      : undefined,
+});
+
+db.on("error", (err) => {
+  console.error("[db] client error", err);
+});
+
+db.connect()
+  .then(() => console.log("[db] connected"))
+  .catch((err) => {
+    console.error("[db] connection failed", err);
+    process.exit(1);
+  });
 
 function sendApiError(res, status, payload) {
   return res.status(status).json({
