@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const { Client } = require("pg");
+const { Pool } = require("pg");
 const Facturapi = require("facturapi").default;
 const ftp = require("basic-ftp");
 
@@ -10,24 +10,20 @@ const app = express();
 app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }));
 app.use(express.json({ limit: "2mb" }));
 
-const db = new Client({
+const db = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl:
     process.env.NODE_ENV === "production"
       ? { rejectUnauthorized: false }
       : undefined,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
 });
 
 db.on("error", (err) => {
-  console.error("[db] client error", err);
+  console.error("[db] pool error (idle client)", err);
 });
-
-db.connect()
-  .then(() => console.log("[db] connected"))
-  .catch((err) => {
-    console.error("[db] connection failed", err);
-    process.exit(1);
-  });
 
 function sendApiError(res, status, payload) {
   return res.status(status).json({
