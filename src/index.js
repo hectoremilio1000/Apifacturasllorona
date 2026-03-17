@@ -36,11 +36,12 @@ function sendApiError(res, status, payload) {
 }
 
 function normalizeTextForSat(str) {
-  // Ayuda para hint, NO modifica tu DB automáticamente (solo mensaje al usuario)
+  // Mayúsculas, quita acentos pero PRESERVA la Ñ (válida para SAT)
   return String(str || "")
     .toUpperCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // quita acentos
+    .replace(/[\u0300-\u0302\u0304-\u036f]/g, "") // quita acentos, pero conserva \u0303 (tilde de Ñ)
+    .normalize("NFC") // recompone Ñ (N + combining tilde → Ñ)
     .replace(/\s+/g, " ")
     .trim();
 }
