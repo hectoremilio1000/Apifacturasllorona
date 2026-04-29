@@ -448,7 +448,9 @@ app.get("/api/orders/lookup", async (req, res) => {
     i.id as "invoiceId",
     i.emailed_at as "emailedAt"
   from public.orders o
-  left join public.invoices i on i.order_id = o.id
+  left join public.invoices i
+    on i.order_id = o.id
+   and i.facturapi_status is distinct from 'canceled'
   where o.numcheque = $1
     and o.fecha >= $2
     and o.fecha < $3
@@ -543,9 +545,13 @@ app.post("/api/invoices", async (req, res) => {
     }
     const order = ord.rows[0];
 
-    // 4) Ya facturada
+    // 4) Ya facturada (ignoramos canceladas: si la única invoice está cancelada, se permite refacturar)
     const ex = await db.query(
-      `select * from public.invoices where order_id=$1 limit 1`,
+      `select * from public.invoices
+       where order_id=$1
+         and facturapi_status is distinct from 'canceled'
+       order by id desc
+       limit 1`,
       [orderId],
     );
     if (ex.rows.length) {
